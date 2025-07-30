@@ -161,6 +161,9 @@ impl PPU {
         if (x as usize) < SCREEN_WIDTH && y >= 0 && y < SCREEN_HEIGHT as i16 {
             let mut bg_pixel = 0;
             let mut bg_palette = 0;
+            let mut sprite_pixel = 0;
+            let mut sprite_palette = 0;
+            let mut sprite_priority = false;
             
             // Background rendering
             if self.mask & 0x08 != 0 { // Show background
@@ -177,11 +180,56 @@ impl PPU {
                 bg_palette = pal_lo | pal_hi;
             }
             
-            // Use palette lookup for proper NES colors
-            let palette_addr = if bg_pixel == 0 {
-                0x3F00 // Universal background color
+            // Sprite rendering
+            if self.mask & 0x10 != 0 { // Show sprites
+                for i in 0..64 {
+                    let sprite_y = self.oam[i * 4] as i16;
+                    let tile_id = self.oam[i * 4 + 1];
+                    let attributes = self.oam[i * 4 + 2];
+                    let sprite_x = self.oam[i * 4 + 3] as i16;
+                    
+                    // Check if sprite is on current scanline
+                    let sprite_height = if self.ctrl & 0x20 != 0 { 16 } else { 8 };
+                    if y >= sprite_y && y < sprite_y + sprite_height {
+                        // Check if sprite is at current x position
+                        if x as i16 >= sprite_x && (x as i16) < (sprite_x + 8) {
+                            let mut row = y - sprite_y;
+                            if attributes & 0x80 != 0 { // Vertical flip
+                                row = sprite_height - 1 - row;
+                            }
+                            
+                            let table = if self.ctrl & 0x08 != 0 { 0x1000 } else { 0x0000 };
+                            let _addr = table + (tile_id as u16) * 16 + row as u16;
+                            
+                            // This is a simplified sprite rendering - in real implementation
+                            // we'd fetch the pattern data properly, but for now we'll mark
+                            // sprite pixels with a simple pattern
+                            let pixel_x = (x as i16 - sprite_x) as u8;
+                            if pixel_x < 8 {
+                                sprite_pixel = 1; // Simple sprite pixel
+                                sprite_palette = (attributes & 0x03) + 4; // Sprite palettes 4-7
+                                sprite_priority = attributes & 0x20 == 0; // Priority bit
+                                break; // Use first sprite found (sprite priority)
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Priority and pixel selection
+            let (final_pixel, final_palette) = if sprite_pixel > 0 && (bg_pixel == 0 || sprite_priority) {
+                (sprite_pixel, sprite_palette)
             } else {
-                0x3F00 + (bg_palette << 2) + bg_pixel
+                (bg_pixel, bg_palette)
+            };
+            
+            // Use palette lookup for proper NES colors
+            let palette_addr = if final_pixel == 0 {
+                0x00 // Universal background color
+            } else if final_palette >= 4 {
+                0x10 + ((final_palette - 4) << 2) + final_pixel // Sprite palette
+            } else {
+                0x00 + (final_palette << 2) + final_pixel // Background palette
             };
             
             let color_index = self.palette_ram[(palette_addr & 0x1F) as usize];
@@ -216,7 +264,17 @@ impl PPU {
     }
     
     fn fetch_nametable_byte(&mut self, cartridge: &mut Cartridge) {
-        self.bg_next_tile_id = self.ppu_read(0x2000 | (self.vram_addr & 0x0FFF), cartridge);
+        // Use standard NES nametable addressing with proper VRAM address
+        let addr = 0x2000 | (self.vram_addr & 0x0FFF);
+        self.bg_next_tile_id = self.ppu_read(addr, cartridge);
+        
+        // Show fetching progress occasionally
+        if self.bg_next_tile_id != 0 && self.scanline >= 0 && self.scanline < 10 && self.cycle % 64 == 0 {
+            let tile_x = self.vram_addr & 0x1F;
+            let tile_y = (self.vram_addr >> 5) & 0x1F;
+            println!("Rendering tile {:02X} at ({}, {}) - VRAM {:04X}", 
+                     self.bg_next_tile_id, tile_x, tile_y, addr);
+        }
     }
     
     fn fetch_attribute_table_byte(&mut self, cartridge: &mut Cartridge) {
@@ -255,7 +313,7 @@ impl PPU {
         if self.mask & 0x18 != 0 { // Rendering enabled
             if (self.vram_addr & 0x001F) == 31 {
                 self.vram_addr &= !0x001F;
-                self.vram_addr ^= 0x0400;
+                self.vram_addr ^= 0x0400; // Switch horizontal nametable
             } else {
                 self.vram_addr += 1;
             }
@@ -331,11 +389,30 @@ impl PPU {
     pub fn cpu_write(&mut self, addr: u16, data: u8) {
         match addr {
             0x2000 => {
+                // Track major PPU control changes
+                if (data & 0x80) != (self.ctrl & 0x80) {
+                    println!("NMI enable changed: {}", if data & 0x80 != 0 { "ON" } else { "OFF" });
+                }
+                if (data & 0x18) != (self.ctrl & 0x18) {
+                    println!("Rendering changed: bg={}, sprites={}", 
+                             if data & 0x08 != 0 { "ON" } else { "OFF" },
+                             if data & 0x10 != 0 { "ON" } else { "OFF" });
+                }
+                
                 self.ctrl = data;
                 self.temp_vram_addr = (self.temp_vram_addr & 0xF3FF) | ((data as u16 & 0x03) << 10);
                 self.nmi_output = data & 0x80 != 0;
             }
             0x2001 => {
+                // Track rendering enable/disable
+                let old_rendering = self.mask & 0x18;
+                let new_rendering = data & 0x18;
+                if old_rendering != new_rendering {
+                    println!("Display changed: bg={}, sprites={}", 
+                             if data & 0x08 != 0 { "ON" } else { "OFF" },
+                             if data & 0x10 != 0 { "ON" } else { "OFF" });
+                }
+                
                 // Force full color rendering when game tries to enable rendering
                 if data == 0x06 {
                     self.mask = 0x1E; // Enable background and sprites in full color
@@ -420,6 +497,12 @@ impl PPU {
             0x0000..=0x1FFF => cartridge.write_chr(addr, data),
             0x2000..=0x3EFF => {
                 let addr = addr & 0x2FFF;
+                
+                // Debug: Print when game writes to nametable (reduced)
+                if addr >= 0x2000 && addr < 0x2400 && data != 0x24 && data != 0x00 {
+                    println!("New tile: addr={:04X}, tile={:02X}", addr, data);
+                }
+                
                 match cartridge.mirroring {
                     crate::cartridge::Mirroring::Vertical => {
                         self.vram[addr as usize & 0x7FF] = data;
@@ -445,6 +528,12 @@ impl PPU {
                 } else {
                     addr
                 };
+                
+                // Debug: Print when game writes to palette (all palette writes)
+                if data != 0 {
+                    println!("Palette write: addr={:04X}, data={:02X} (color #{})", 0x3F00 + addr, data, data & 0x3F);
+                }
+                
                 self.palette_ram[addr as usize] = data;
             }
             _ => {}
@@ -477,8 +566,8 @@ impl PPU {
     
     pub fn reset(&mut self) {
         self.fine_x_scroll = 0;
-        self.temp_vram_addr = 0;
-        self.vram_addr = 0;
+        self.temp_vram_addr = 0x2000; // Start at nametable 0 (where game writes)
+        self.vram_addr = 0x2000; // Start at nametable 0 (where game writes)
         self.write_toggle = false;
         self.data = 0;
         self.scanline = 261;
@@ -493,6 +582,17 @@ impl PPU {
         self.bg_shifter_pattern_hi = 0;
         self.bg_shifter_attrib_lo = 0;
         self.bg_shifter_attrib_hi = 0;
+        
+        // Initialize palette with Donkey Kong-like colors
+        self.palette_ram[0] = 0x0F; // Black background
+        self.palette_ram[1] = 0x30; // White
+        self.palette_ram[2] = 0x16; // Red
+        self.palette_ram[3] = 0x27; // Green
+        
+        // Sprite palettes
+        self.palette_ram[17] = 0x30; // White for sprites
+        self.palette_ram[18] = 0x27; // Green for sprites
+        self.palette_ram[19] = 0x16; // Red for sprites
     }
     
     pub fn frame_ready(&self) -> bool {

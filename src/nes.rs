@@ -57,6 +57,7 @@ pub struct NES {
     controller_strobe: bool,
     cycles: u64,
     instruction_count: u32, // For debugging
+    frame_count: u32, // Track total frames rendered
 }
 
 impl NES {
@@ -72,6 +73,7 @@ impl NES {
             controller_strobe: false,
             cycles: 0,
             instruction_count: 0,
+            frame_count: 0,
         }
     }
     
@@ -125,6 +127,13 @@ impl NES {
                     if self.ppu.frame_ready() {
                         self.frame_complete = true;
                         self.ppu.frame_done();
+                        self.frame_count += 1;
+                        
+                        // Provide feedback every few seconds
+                        if self.frame_count % 300 == 0 { // Every 5 seconds at 60 FPS
+                            println!("Game running: {} frames completed ({:.1}s)", 
+                                     self.frame_count, self.frame_count as f32 / 60.0);
+                        }
                         break;
                     }
                 }
