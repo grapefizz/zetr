@@ -1,6 +1,8 @@
 mod cartridge;
 mod ppu;
 mod nes;
+mod cpu;
+mod bus;
 
 use std::env;
 use std::time::{Duration, Instant};
@@ -90,6 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             texture.update(None, frame_buffer, SCREEN_WIDTH * 3)?;
             canvas.copy(&texture, None, None)?;
             canvas.present();
+            nes.frame_done();
         }
         
         // Frame rate limiting

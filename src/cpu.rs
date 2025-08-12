@@ -9,6 +9,8 @@ pub struct CPU {
     pub sp: u8,     // Stack pointer
     pub status: u8, // Status register
     pub cycles: u64,
+    pub dma_request: bool,
+    pub dma_page: u8,
 }
 
 // Status flags
@@ -31,6 +33,8 @@ impl CPU {
             sp: 0xFD,
             status: FLAG_INTERRUPT | FLAG_UNUSED,
             cycles: 0,
+            dma_request: false,
+            dma_page: 0,
         }
     }
     
@@ -49,16 +53,16 @@ impl CPU {
         self.cycles = 0;
     }
     
-    pub fn step(&mut self, read_fn: &mut dyn FnMut(u16) -> u8, write_fn: &mut dyn FnMut(u16, u8)) -> u8 {
-        let opcode = read_fn(self.pc);
+    pub fn step(&mut self, bus: &mut Bus) -> u8 {
+        let opcode = bus.read(self.pc);
         self.pc = self.pc.wrapping_add(1);
         
-        let cycles = self.execute_instruction(opcode, read_fn, write_fn);
+        let cycles = self.execute_instruction(opcode, bus);
         self.cycles = self.cycles.wrapping_add(cycles as u64);
         cycles
     }
     
-    fn execute_instruction(&mut self, opcode: u8, read_fn: &mut dyn FnMut(u16) -> u8, write_fn: &mut dyn FnMut(u16, u8)) -> u8 {
+    fn execute_instruction(&mut self, opcode: u8, bus: &mut Bus) -> u8 {
         match opcode {
             // LDA - Load Accumulator
             0xA9 => { let val = self.immediate(bus); self.lda(val); 2 }
@@ -337,7 +341,12 @@ impl CPU {
     
     fn absolute_write(&mut self, bus: &mut Bus, data: u8) {
         let addr = self.absolute_address(bus);
-        bus.write(addr, data);
+        if addr == 0x4014 {
+            self.dma_request = true;
+            self.dma_page = data;
+        } else {
+            bus.write(addr, data);
+        }
     }
     
     fn absolute_x_write(&mut self, bus: &mut Bus, data: u8) {
@@ -457,7 +466,7 @@ impl CPU {
     }
     
     fn jsr(&mut self, bus: &mut Bus) {
-        let ret_addr = self.pc + 1;
+        let ret_addr = self.pc.wrapping_sub(1);
         self.push(bus, (ret_addr >> 8) as u8);
         self.push(bus, ret_addr as u8);
         self.pc = self.absolute_address(bus);
@@ -466,7 +475,7 @@ impl CPU {
     fn rts(&mut self, bus: &mut Bus) {
         let lo = self.pull(bus) as u16;
         let hi = self.pull(bus) as u16;
-        self.pc = ((hi << 8) | lo) + 1;
+        self.pc = ((hi << 8) | lo).wrapping_add(1);
     }
     
     fn rti(&mut self, bus: &mut Bus) {

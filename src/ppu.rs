@@ -3,6 +3,16 @@ use crate::cartridge::Cartridge;
 const SCREEN_WIDTH: usize = 256;
 const SCREEN_HEIGHT: usize = 240;
 
+#[derive(Debug, Default, Clone, Copy)]
+struct Sprite {
+    y: u8,
+    tile_id: u8,
+    attributes: u8,
+    x: u8,
+    pattern_lo: u8,
+    pattern_hi: u8,
+}
+
 #[derive(Debug)]
 pub struct PPU {
     // Registers
@@ -45,6 +55,10 @@ pub struct PPU {
     pub bg_shifter_attrib_lo: u16,
     pub bg_shifter_attrib_hi: u16,
     
+    // Sprite rendering
+    scanline_sprites: [Sprite; 8],
+    sprite_count: usize,
+    
     // NMI
     pub nmi_occurred: bool,
     pub nmi_output: bool,
@@ -82,19 +96,18 @@ impl PPU {
             bg_shifter_pattern_hi: 0,
             bg_shifter_attrib_lo: 0,
             bg_shifter_attrib_hi: 0,
+            scanline_sprites: [Sprite::default(); 8],
+            sprite_count: 0,
             nmi_occurred: false,
             nmi_output: false,
             nmi_previous: false,
         }
     }
     
-    pub fn step(&mut self, cartridge: &mut Cartridge) -> bool {
-        let mut nmi = false;
-        
+    pub fn step(&mut self, cartridge: &mut Cartridge) {
         if self.scanline >= -1 && self.scanline < 240 {
-            // Visible scanlines
             if self.scanline == 0 && self.cycle == 0 {
-                self.cycle = 1; // Skip cycle 0 on first scanline
+                self.cycle = 1;
             }
             
             if (self.cycle >= 2 && self.cycle < 258) || (self.cycle >= 321 && self.cycle < 338) {
@@ -119,23 +132,26 @@ impl PPU {
             
             if self.cycle == 257 {
                 self.transfer_address_x();
+                self.evaluate_sprites();
+            }
+
+            if self.cycle == 320 {
+                self.fetch_sprite_patterns(cartridge);
             }
             
             if self.scanline == -1 && self.cycle >= 280 && self.cycle < 305 {
                 self.transfer_address_y();
             }
             
-            // Render pixel
             if self.scanline >= 0 && self.cycle >= 1 && self.cycle <= 256 {
                 self.render_pixel();
             }
         }
         
         if self.scanline == 241 && self.cycle == 1 {
-            self.status |= 0x80; // Set VBlank flag
-            self.nmi_occurred = true;
-            if self.ctrl & 0x80 != 0 { // NMI enable
-                nmi = true;
+            self.status |= 0x80;
+            if self.ctrl & 0x80 != 0 {
+                self.nmi_occurred = true;
             }
         }
         
@@ -146,12 +162,10 @@ impl PPU {
             if self.scanline >= 261 {
                 self.scanline = -1;
                 self.frame_complete = true;
-                self.status &= !0x80; // Clear VBlank
+                self.status &= !0x80;
                 self.nmi_occurred = false;
             }
         }
-        
-        nmi
     }
     
     fn render_pixel(&mut self) {
@@ -161,78 +175,54 @@ impl PPU {
         if (x as usize) < SCREEN_WIDTH && y >= 0 && y < SCREEN_HEIGHT as i16 {
             let mut bg_pixel = 0;
             let mut bg_palette = 0;
+            
+            if self.mask & 0x08 != 0 {
+                let pixel_bit = 15 - self.fine_x_scroll as u16;
+                let p0 = (self.bg_shifter_pattern_lo >> pixel_bit) & 1;
+                let p1 = (self.bg_shifter_pattern_hi >> pixel_bit) & 1;
+                bg_pixel = (p1 << 1) | p0;
+                
+                let palette_bit = 15 - self.fine_x_scroll as u16;
+                let pal_lo = (self.bg_shifter_attrib_lo >> palette_bit) & 1;
+                let pal_hi = (self.bg_shifter_attrib_hi >> palette_bit) & 1;
+                bg_palette = (pal_hi << 1) | pal_lo;
+            }
+            
             let mut sprite_pixel = 0;
             let mut sprite_palette = 0;
             let mut sprite_priority = false;
-            
-            // Background rendering
-            if self.mask & 0x08 != 0 { // Show background
-                // Use the background shifters for proper scrolling
-                let pixel_bit = 15 - self.fine_x_scroll as u16;
-                
-                let p0 = if self.bg_shifter_pattern_lo & (1 << pixel_bit) != 0 { 1 } else { 0 };
-                let p1 = if self.bg_shifter_pattern_hi & (1 << pixel_bit) != 0 { 2 } else { 0 };
-                bg_pixel = p0 | p1;
-                
-                let palette_bit = 15 - self.fine_x_scroll as u16;
-                let pal_lo = if self.bg_shifter_attrib_lo & (1 << palette_bit) != 0 { 1 } else { 0 };
-                let pal_hi = if self.bg_shifter_attrib_hi & (1 << palette_bit) != 0 { 2 } else { 0 };
-                bg_palette = pal_lo | pal_hi;
-            }
-            
-            // Sprite rendering
-            if self.mask & 0x10 != 0 { // Show sprites
-                for i in 0..64 {
-                    let sprite_y = self.oam[i * 4] as i16;
-                    let tile_id = self.oam[i * 4 + 1];
-                    let attributes = self.oam[i * 4 + 2];
-                    let sprite_x = self.oam[i * 4 + 3] as i16;
-                    
-                    // Check if sprite is on current scanline
-                    let sprite_height = if self.ctrl & 0x20 != 0 { 16 } else { 8 };
-                    if y >= sprite_y && y < sprite_y + sprite_height {
-                        // Check if sprite is at current x position
-                        if x as i16 >= sprite_x && (x as i16) < (sprite_x + 8) {
-                            let mut row = y - sprite_y;
-                            if attributes & 0x80 != 0 { // Vertical flip
-                                row = sprite_height - 1 - row;
+
+            if self.mask & 0x10 != 0 {
+                for i in 0..self.sprite_count {
+                    let sprite = &mut self.scanline_sprites[i];
+                    if sprite.x == 0 {
+                        let p0 = (sprite.pattern_lo & 0x80) >> 7;
+                        let p1 = (sprite.pattern_hi & 0x80) >> 7;
+                        let pixel = (p1 << 1) | p0;
+
+                        if pixel != 0 {
+                            sprite_pixel = pixel;
+                            sprite_palette = (sprite.attributes & 0x03) + 4;
+                            sprite_priority = (sprite.attributes & 0x20) == 0;
+                            
+                            if self.mask & 0x08 != 0 && i == 0 && sprite_pixel != 0 && bg_pixel != 0 {
+                                self.status |= 0x40;
                             }
                             
-                            let table = if self.ctrl & 0x08 != 0 { 0x1000 } else { 0x0000 };
-                            let _addr = table + (tile_id as u16) * 16 + row as u16;
-                            
-                            // This is a simplified sprite rendering - in real implementation
-                            // we'd fetch the pattern data properly, but for now we'll mark
-                            // sprite pixels with a simple pattern
-                            let pixel_x = (x as i16 - sprite_x) as u8;
-                            if pixel_x < 8 {
-                                sprite_pixel = 1; // Simple sprite pixel
-                                sprite_palette = (attributes & 0x03) + 4; // Sprite palettes 4-7
-                                sprite_priority = attributes & 0x20 == 0; // Priority bit
-                                break; // Use first sprite found (sprite priority)
-                            }
+                            break;
                         }
                     }
                 }
             }
             
-            // Priority and pixel selection
             let (final_pixel, final_palette) = if sprite_pixel > 0 && (bg_pixel == 0 || sprite_priority) {
                 (sprite_pixel, sprite_palette)
             } else {
-                (bg_pixel, bg_palette)
+                (bg_pixel as u8, bg_palette as u8)
             };
             
-            // Use palette lookup for proper NES colors
-            let palette_addr = if final_pixel == 0 {
-                0x00 // Universal background color
-            } else if final_palette >= 4 {
-                0x10 + ((final_palette - 4) << 2) + final_pixel // Sprite palette
-            } else {
-                0x00 + (final_palette << 2) + final_pixel // Background palette
-            };
-            
-            let color_index = self.palette_ram[(palette_addr & 0x1F) as usize];
+            let palette_addr = if final_pixel == 0 { 0 } else { (final_palette << 2) | final_pixel };
+            let color_index = self.palette_ram[palette_addr as usize & 0x1F];
             let color = self.get_color_from_palette(color_index);
             
             let pixel_index = (y as usize * SCREEN_WIDTH + x as usize) * 3;
@@ -245,75 +235,126 @@ impl PPU {
     }
     
     fn update_shifters(&mut self) {
-        if self.mask & 0x08 != 0 { // Show background
+        if self.mask & 0x08 != 0 {
             self.bg_shifter_pattern_lo <<= 1;
             self.bg_shifter_pattern_hi <<= 1;
             self.bg_shifter_attrib_lo <<= 1;
             self.bg_shifter_attrib_hi <<= 1;
+        }
+        if self.mask & 0x10 != 0 && self.cycle >= 1 && self.cycle < 258 {
+            for i in 0..self.sprite_count {
+                if self.scanline_sprites[i].x > 0 {
+                    self.scanline_sprites[i].x -= 1;
+                } else {
+                    self.scanline_sprites[i].pattern_lo <<= 1;
+                    self.scanline_sprites[i].pattern_hi <<= 1;
+                }
+            }
+        }
+    }
+
+    fn evaluate_sprites(&mut self) {
+        self.sprite_count = 0;
+        let sprite_height = if self.ctrl & 0x20 != 0 { 16 } else { 8 };
+
+        for i in 0..64 {
+            let y = self.oam[i * 4] as i16;
+            let diff = self.scanline - y;
+
+            if diff >= 0 && diff < sprite_height {
+                if self.sprite_count < 8 {
+                    self.scanline_sprites[self.sprite_count].y = self.oam[i * 4];
+                    self.scanline_sprites[self.sprite_count].tile_id = self.oam[i * 4 + 1];
+                    self.scanline_sprites[self.sprite_count].attributes = self.oam[i * 4 + 2];
+                    self.scanline_sprites[self.sprite_count].x = self.oam[i * 4 + 3];
+                    self.sprite_count += 1;
+                } else {
+                    self.status |= 0x20;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn fetch_sprite_patterns(&mut self, cartridge: &mut Cartridge) {
+        let sprite_height = if self.ctrl & 0x20 != 0 { 16 } else { 8 };
+
+        for i in 0..self.sprite_count {
+            let sprite_y = self.scanline_sprites[i].y;
+            let sprite_tile_id = self.scanline_sprites[i].tile_id;
+            let sprite_attributes = self.scanline_sprites[i].attributes;
+            
+            let mut row = (self.scanline as u16) - (sprite_y as u16);
+
+            if sprite_attributes & 0x80 != 0 {
+                row = sprite_height as u16 - 1 - row;
+            }
+
+            let (tile_id, table) = if sprite_height == 16 {
+                let table = if sprite_tile_id & 0x01 != 0 { 0x1000 } else { 0x0000 };
+                let tile_id = sprite_tile_id & 0xFE;
+                let tile_id = if row < 8 { tile_id } else { tile_id + 1 };
+                (tile_id, table)
+            } else {
+                let table = if self.ctrl & 0x08 != 0 { 0x1000 } else { 0x0000 };
+                (sprite_tile_id, table)
+            };
+            
+            let row = row & 0x07;
+            let addr_lo = table + (tile_id as u16) * 16 + row;
+            let addr_hi = addr_lo + 8;
+
+            let mut lo = self.ppu_read(addr_lo, cartridge);
+            let mut hi = self.ppu_read(addr_hi, cartridge);
+
+            if sprite_attributes & 0x40 != 0 {
+                lo = lo.reverse_bits();
+                hi = hi.reverse_bits();
+            }
+
+            self.scanline_sprites[i].pattern_lo = lo;
+            self.scanline_sprites[i].pattern_hi = hi;
         }
     }
     
     fn load_background_shifters(&mut self) {
         self.bg_shifter_pattern_lo = (self.bg_shifter_pattern_lo & 0xFF00) | self.bg_next_tile_lsb as u16;
         self.bg_shifter_pattern_hi = (self.bg_shifter_pattern_hi & 0xFF00) | self.bg_next_tile_msb as u16;
-        
-        self.bg_shifter_attrib_lo = (self.bg_shifter_attrib_lo & 0xFF00) | 
-            if self.bg_next_tile_attrib & 0x01 != 0 { 0xFF } else { 0x00 };
-        self.bg_shifter_attrib_hi = (self.bg_shifter_attrib_hi & 0xFF00) | 
-            if self.bg_next_tile_attrib & 0x02 != 0 { 0xFF } else { 0x00 };
+        self.bg_shifter_attrib_lo = (self.bg_shifter_attrib_lo & 0xFF00) | if self.bg_next_tile_attrib & 1 != 0 { 0xFF } else { 0 };
+        self.bg_shifter_attrib_hi = (self.bg_shifter_attrib_hi & 0xFF00) | if self.bg_next_tile_attrib & 2 != 0 { 0xFF } else { 0 };
     }
     
     fn fetch_nametable_byte(&mut self, cartridge: &mut Cartridge) {
-        // Use standard NES nametable addressing with proper VRAM address
         let addr = 0x2000 | (self.vram_addr & 0x0FFF);
         self.bg_next_tile_id = self.ppu_read(addr, cartridge);
-        
-        // Show fetching progress occasionally
-        if self.bg_next_tile_id != 0 && self.scanline >= 0 && self.scanline < 10 && self.cycle % 64 == 0 {
-            let tile_x = self.vram_addr & 0x1F;
-            let tile_y = (self.vram_addr >> 5) & 0x1F;
-            println!("Rendering tile {:02X} at ({}, {}) - VRAM {:04X}", 
-                     self.bg_next_tile_id, tile_x, tile_y, addr);
-        }
     }
     
     fn fetch_attribute_table_byte(&mut self, cartridge: &mut Cartridge) {
-        let addr = 0x23C0 | (self.vram_addr & 0x0C00) | 
-                   ((self.vram_addr >> 4) & 0x38) | ((self.vram_addr >> 2) & 0x07);
+        let addr = 0x23C0 | (self.vram_addr & 0x0C00) | ((self.vram_addr >> 4) & 0x38) | ((self.vram_addr >> 2) & 0x07);
         let attribute = self.ppu_read(addr, cartridge);
-        
-        self.bg_next_tile_attrib = if self.vram_addr & 0x0002 != 0 { 
-            attribute >> 2 
-        } else { 
-            attribute 
-        };
-        
-        if self.vram_addr & 0x0040 != 0 { 
-            self.bg_next_tile_attrib >>= 4; 
-        }
-        
-        self.bg_next_tile_attrib &= 0x03;
+        let shift = ((self.vram_addr >> 4) & 4) | (self.vram_addr & 2);
+        self.bg_next_tile_attrib = (attribute >> shift) & 3;
     }
     
     fn fetch_low_bg_tile_byte(&mut self, cartridge: &mut Cartridge) {
-        let fine_y = (self.vram_addr >> 12) & 0x07;
+        let fine_y = (self.vram_addr >> 12) & 7;
         let table = if self.ctrl & 0x10 != 0 { 0x1000 } else { 0x0000 };
         let addr = table + (self.bg_next_tile_id as u16) * 16 + fine_y;
         self.bg_next_tile_lsb = self.ppu_read(addr, cartridge);
     }
     
     fn fetch_high_bg_tile_byte(&mut self, cartridge: &mut Cartridge) {
-        let fine_y = (self.vram_addr >> 12) & 0x07;
+        let fine_y = (self.vram_addr >> 12) & 7;
         let table = if self.ctrl & 0x10 != 0 { 0x1000 } else { 0x0000 };
         let addr = table + (self.bg_next_tile_id as u16) * 16 + fine_y + 8;
         self.bg_next_tile_msb = self.ppu_read(addr, cartridge);
     }
     
     fn increment_scroll_x(&mut self) {
-        if self.mask & 0x18 != 0 { // Rendering enabled
+        if self.mask & 0x18 != 0 {
             if (self.vram_addr & 0x001F) == 31 {
                 self.vram_addr &= !0x001F;
-                self.vram_addr ^= 0x0400; // Switch horizontal nametable
+                self.vram_addr ^= 0x0400;
             } else {
                 self.vram_addr += 1;
             }
@@ -321,7 +362,7 @@ impl PPU {
     }
     
     fn increment_scroll_y(&mut self) {
-        if self.mask & 0x18 != 0 { // Rendering enabled
+        if self.mask & 0x18 != 0 {
             if (self.vram_addr & 0x7000) != 0x7000 {
                 self.vram_addr += 0x1000;
             } else {
@@ -341,86 +382,44 @@ impl PPU {
     }
     
     fn transfer_address_x(&mut self) {
-        if self.mask & 0x18 != 0 { // Rendering enabled
+        if self.mask & 0x18 != 0 {
             self.vram_addr = (self.vram_addr & 0xFBE0) | (self.temp_vram_addr & 0x041F);
         }
     }
     
     fn transfer_address_y(&mut self) {
-        if self.mask & 0x18 != 0 { // Rendering enabled
+        if self.mask & 0x18 != 0 {
             self.vram_addr = (self.vram_addr & 0x841F) | (self.temp_vram_addr & 0x7BE0);
         }
     }
     
-    pub fn cpu_read(&mut self, addr: u16) -> u8 {
+    pub fn cpu_read(&mut self, addr: u16, cartridge: &mut Cartridge) -> u8 {
         match addr {
-            0x2000 => 0, // Write only
-            0x2001 => 0, // Write only
             0x2002 => {
-                // Ensure vblank is set on first read (games expect this after reset)
-                let data = (self.status & 0xE0) | (self.data & 0x1F);
-                self.status &= !0x80; // Clear VBlank after read
-                self.nmi_occurred = false;
+                let data = (self.status & 0xE0) | (self.read_buffer & 0x1F);
+                self.status &= !0x80;
                 self.write_toggle = false;
                 data
             }
-            0x2003 => 0, // Write only
             0x2004 => self.oam[self.oam_addr as usize],
-            0x2005 => 0, // Write only
-            0x2006 => 0, // Write only
             0x2007 => {
-                let data = self.data;
-                let mut dummy_cart = Cartridge::dummy();
-                self.data = self.ppu_read(self.vram_addr, &mut dummy_cart);
-                
-                let result = if self.vram_addr >= 0x3F00 {
-                    self.data
-                } else {
-                    data
-                };
-                
-                self.vram_addr += if self.ctrl & 0x04 != 0 { 32 } else { 1 };
-                result
+                let mut data = self.read_buffer;
+                self.read_buffer = self.ppu_read(self.vram_addr, cartridge);
+                if self.vram_addr >= 0x3F00 { data = self.read_buffer; }
+                self.vram_addr = self.vram_addr.wrapping_add(if self.ctrl & 4 != 0 { 32 } else { 1 });
+                data
             }
             _ => 0,
         }
     }
     
-    pub fn cpu_write(&mut self, addr: u16, data: u8) {
+    pub fn cpu_write(&mut self, addr: u16, data: u8, cartridge: &mut Cartridge) {
         match addr {
             0x2000 => {
-                // Track major PPU control changes
-                if (data & 0x80) != (self.ctrl & 0x80) {
-                    println!("NMI enable changed: {}", if data & 0x80 != 0 { "ON" } else { "OFF" });
-                }
-                if (data & 0x18) != (self.ctrl & 0x18) {
-                    println!("Rendering changed: bg={}, sprites={}", 
-                             if data & 0x08 != 0 { "ON" } else { "OFF" },
-                             if data & 0x10 != 0 { "ON" } else { "OFF" });
-                }
-                
                 self.ctrl = data;
-                self.temp_vram_addr = (self.temp_vram_addr & 0xF3FF) | ((data as u16 & 0x03) << 10);
-                self.nmi_output = data & 0x80 != 0;
+                self.temp_vram_addr = (self.temp_vram_addr & 0xF3FF) | ((data as u16 & 3) << 10);
             }
-            0x2001 => {
-                // Track rendering enable/disable
-                let old_rendering = self.mask & 0x18;
-                let new_rendering = data & 0x18;
-                if old_rendering != new_rendering {
-                    println!("Display changed: bg={}, sprites={}", 
-                             if data & 0x08 != 0 { "ON" } else { "OFF" },
-                             if data & 0x10 != 0 { "ON" } else { "OFF" });
-                }
-                
-                // Force full color rendering when game tries to enable rendering
-                if data == 0x06 {
-                    self.mask = 0x1E; // Enable background and sprites in full color
-                } else {
-                    self.mask = data;
-                }
-            }
-            0x2002 => {}, // Read only
+            0x2001 => self.mask = data,
             0x2003 => self.oam_addr = data,
             0x2004 => {
                 self.oam[self.oam_addr as usize] = data;
@@ -428,17 +427,16 @@ impl PPU {
             }
             0x2005 => {
                 if !self.write_toggle {
-                    self.fine_x_scroll = data & 0x07;
+                    self.fine_x_scroll = data & 7;
                     self.temp_vram_addr = (self.temp_vram_addr & 0xFFE0) | ((data as u16) >> 3);
                 } else {
-                    self.temp_vram_addr = (self.temp_vram_addr & 0x8FFF) | (((data as u16) & 0x07) << 12);
-                    self.temp_vram_addr = (self.temp_vram_addr & 0xFC1F) | (((data as u16) & 0xF8) << 2);
+                    self.temp_vram_addr = (self.temp_vram_addr & 0x8C1F) | ((data as u16 & 0xF8) << 2) | ((data as u16 & 7) << 12);
                 }
                 self.write_toggle = !self.write_toggle;
             }
             0x2006 => {
                 if !self.write_toggle {
-                    self.temp_vram_addr = (self.temp_vram_addr & 0x80FF) | (((data as u16) & 0x3F) << 8);
+                    self.temp_vram_addr = (self.temp_vram_addr & 0x00FF) | ((data as u16 & 0x3F) << 8);
                 } else {
                     self.temp_vram_addr = (self.temp_vram_addr & 0xFF00) | (data as u16);
                     self.vram_addr = self.temp_vram_addr;
@@ -446,9 +444,8 @@ impl PPU {
                 self.write_toggle = !self.write_toggle;
             }
             0x2007 => {
-                let mut dummy_cart = Cartridge::dummy();
-                self.ppu_write(self.vram_addr, data, &mut dummy_cart);
-                self.vram_addr += if self.ctrl & 0x04 != 0 { 32 } else { 1 };
+                self.ppu_write(self.vram_addr, data, cartridge);
+                self.vram_addr = self.vram_addr.wrapping_add(if self.ctrl & 4 != 0 { 32 } else { 1 });
             }
             _ => {}
         }
@@ -457,35 +454,19 @@ impl PPU {
     fn ppu_read(&mut self, addr: u16, cartridge: &mut Cartridge) -> u8 {
         let addr = addr & 0x3FFF;
         match addr {
-            0x0000..=0x1FFF => cartridge.read_chr(addr),
+            0..=0x1FFF => cartridge.read_chr(addr),
             0x2000..=0x3EFF => {
-                let addr = addr & 0x2FFF;
+                let addr = addr & 0x0FFF;
                 match cartridge.mirroring {
-                    crate::cartridge::Mirroring::Vertical => {
-                        self.vram[addr as usize & 0x7FF]
-                    }
-                    crate::cartridge::Mirroring::Horizontal => {
-                        if addr >= 0x2000 && addr < 0x2400 {
-                            self.vram[addr as usize & 0x3FF]
-                        } else if addr >= 0x2400 && addr < 0x2800 {
-                            self.vram[(addr as usize & 0x3FF) + 0x400]
-                        } else if addr >= 0x2800 && addr < 0x2C00 {
-                            self.vram[addr as usize & 0x3FF]
-                        } else {
-                            self.vram[(addr as usize & 0x3FF) + 0x400]
-                        }
-                    }
-                    _ => self.vram[addr as usize & 0x7FF],
+                    crate::cartridge::Mirroring::Vertical => self.vram[(addr & 0x07FF) as usize],
+                    crate::cartridge::Mirroring::Horizontal => self.vram[(addr & 0x03FF | ((addr >> 1) & 0x0400)) as usize],
+                    _ => self.vram[addr as usize],
                 }
             }
             0x3F00..=0x3FFF => {
-                let addr = addr & 0x1F;
-                let addr = if addr == 0x10 || addr == 0x14 || addr == 0x18 || addr == 0x1C {
-                    addr - 0x10
-                } else {
-                    addr
-                };
-                self.palette_ram[addr as usize] & if self.mask & 0x01 != 0 { 0x30 } else { 0x3F }
+                let mut addr = addr & 0x1F;
+                if addr == 0x10 || addr == 0x14 || addr == 0x18 || addr == 0x1C { addr -= 0x10; }
+                self.palette_ram[addr as usize] & if self.mask & 1 != 0 { 0x30 } else { 0x3F }
             }
             _ => 0,
         }
@@ -494,46 +475,18 @@ impl PPU {
     fn ppu_write(&mut self, addr: u16, data: u8, cartridge: &mut Cartridge) {
         let addr = addr & 0x3FFF;
         match addr {
-            0x0000..=0x1FFF => cartridge.write_chr(addr, data),
+            0..=0x1FFF => cartridge.write_chr(addr, data),
             0x2000..=0x3EFF => {
-                let addr = addr & 0x2FFF;
-                
-                // Debug: Print when game writes to nametable (reduced)
-                if addr >= 0x2000 && addr < 0x2400 && data != 0x24 && data != 0x00 {
-                    println!("New tile: addr={:04X}, tile={:02X}", addr, data);
-                }
-                
+                let addr = addr & 0x0FFF;
                 match cartridge.mirroring {
-                    crate::cartridge::Mirroring::Vertical => {
-                        self.vram[addr as usize & 0x7FF] = data;
-                    }
-                    crate::cartridge::Mirroring::Horizontal => {
-                        if addr >= 0x2000 && addr < 0x2400 {
-                            self.vram[addr as usize & 0x3FF] = data;
-                        } else if addr >= 0x2400 && addr < 0x2800 {
-                            self.vram[(addr as usize & 0x3FF) + 0x400] = data;
-                        } else if addr >= 0x2800 && addr < 0x2C00 {
-                            self.vram[addr as usize & 0x3FF] = data;
-                        } else {
-                            self.vram[(addr as usize & 0x3FF) + 0x400] = data;
-                        }
-                    }
-                    _ => self.vram[addr as usize & 0x7FF] = data,
+                    crate::cartridge::Mirroring::Vertical => self.vram[(addr & 0x07FF) as usize] = data,
+                    crate::cartridge::Mirroring::Horizontal => self.vram[(addr & 0x03FF | ((addr >> 1) & 0x0400)) as usize] = data,
+                    _ => self.vram[addr as usize] = data,
                 }
             }
             0x3F00..=0x3FFF => {
-                let addr = addr & 0x1F;
-                let addr = if addr == 0x10 || addr == 0x14 || addr == 0x18 || addr == 0x1C {
-                    addr - 0x10
-                } else {
-                    addr
-                };
-                
-                // Debug: Print when game writes to palette (all palette writes)
-                if data != 0 {
-                    println!("Palette write: addr={:04X}, data={:02X} (color #{})", 0x3F00 + addr, data, data & 0x3F);
-                }
-                
+                let mut addr = addr & 0x1F;
+                if addr == 0x10 || addr == 0x14 || addr == 0x18 || addr == 0x1C { addr -= 0x10; }
                 self.palette_ram[addr as usize] = data;
             }
             _ => {}
@@ -541,39 +494,28 @@ impl PPU {
     }
     
     fn get_color_from_palette(&self, index: u8) -> (u8, u8, u8) {
-        // NES palette colors
         let palette = [
-            (0x80, 0x80, 0x80), (0x00, 0x3D, 0xA6), (0x00, 0x12, 0xB0), (0x44, 0x00, 0x96),
-            (0xA1, 0x00, 0x5E), (0xC7, 0x00, 0x28), (0xBA, 0x06, 0x00), (0x8C, 0x17, 0x00),
-            (0x5C, 0x2F, 0x00), (0x10, 0x45, 0x00), (0x05, 0x4A, 0x00), (0x00, 0x47, 0x2E),
-            (0x00, 0x41, 0x66), (0x00, 0x00, 0x00), (0x05, 0x05, 0x05), (0x05, 0x05, 0x05),
-            (0xC7, 0xC7, 0xC7), (0x00, 0x77, 0xFF), (0x21, 0x55, 0xFF), (0x82, 0x37, 0xFA),
-            (0xEB, 0x2F, 0xB5), (0xFF, 0x29, 0x50), (0xFF, 0x22, 0x00), (0xD6, 0x32, 0x00),
-            (0xC4, 0x62, 0x00), (0x35, 0x80, 0x00), (0x05, 0x8F, 0x00), (0x00, 0x8A, 0x55),
-            (0x00, 0x99, 0xCC), (0x21, 0x21, 0x21), (0x09, 0x09, 0x09), (0x09, 0x09, 0x09),
-            (0xFF, 0xFF, 0xFF), (0x0F, 0xD7, 0xFF), (0x69, 0xA2, 0xFF), (0xD4, 0x80, 0xFF),
-            (0xFF, 0x45, 0xF3), (0xFF, 0x61, 0x8B), (0xFF, 0x88, 0x33), (0xFF, 0x9C, 0x12),
-            (0xFA, 0xBC, 0x20), (0x9F, 0xE3, 0x0E), (0x2B, 0xF0, 0x35), (0x0C, 0xF0, 0xA4),
-            (0x05, 0xFB, 0xFF), (0x5E, 0x5E, 0x5E), (0x0D, 0x0D, 0x0D), (0x0D, 0x0D, 0x0D),
-            (0xFF, 0xFF, 0xFF), (0xA6, 0xFC, 0xFF), (0xB3, 0xEC, 0xFF), (0xDA, 0xAB, 0xEB),
-            (0xFF, 0xA8, 0xF9), (0xFF, 0xAB, 0xB3), (0xFF, 0xD2, 0xB0), (0xFF, 0xEF, 0xA6),
-            (0xFF, 0xF7, 0x9C), (0xD7, 0xFF, 0xB3), (0xC5, 0xFF, 0xC4), (0xA6, 0xFF, 0xC8),
-            (0xA2, 0xFF, 0xFF), (0xB3, 0xB3, 0xB3), (0x70, 0x70, 0x70), (0x70, 0x70, 0x70),
+            (84, 84, 84), (0, 30, 116), (8, 16, 144), (48, 0, 136), (68, 0, 100), (92, 0, 48), (84, 4, 0), (60, 24, 0),
+            (32, 42, 0), (8, 58, 0), (0, 64, 0), (0, 60, 40), (0, 50, 88), (0, 0, 0), (0, 0, 0), (0, 0, 0),
+            (152, 150, 152), (8, 76, 196), (48, 50, 236), (92, 30, 228), (136, 20, 176), (160, 20, 100), (152, 34, 32),
+            (120, 60, 0), (84, 90, 0), (40, 114, 0), (8, 124, 0), (0, 118, 40), (0, 102, 120), (0, 0, 0), (0, 0, 0),
+            (0, 0, 0), (236, 238, 236), (76, 154, 236), (120, 124, 236), (176, 98, 236), (228, 84, 236), (236, 88, 180),
+            (236, 106, 100), (212, 136, 32), (160, 170, 0), (116, 196, 0), (76, 208, 32), (56, 204, 108), (56, 180, 220),
+            (60, 60, 60), (0, 0, 0), (0, 0, 0), (236, 238, 236), (168, 204, 236), (188, 188, 236), (212, 178, 236),
+            (236, 174, 236), (236, 174, 212), (236, 180, 176), (228, 196, 144), (204, 210, 120), (180, 222, 120),
+            (168, 226, 144), (152, 226, 180), (160, 214, 228), (160, 162, 160), (0, 0, 0), (0, 0, 0),
         ];
-        
         palette.get(index as usize & 0x3F).copied().unwrap_or((0, 0, 0))
     }
     
     pub fn reset(&mut self) {
         self.fine_x_scroll = 0;
-        self.temp_vram_addr = 0x2000; // Start at nametable 0 (where game writes)
-        self.vram_addr = 0x2000; // Start at nametable 0 (where game writes)
         self.write_toggle = false;
         self.data = 0;
         self.scanline = 261;
         self.cycle = 0;
         self.frame_complete = false;
-        self.status = 0x80; // Set VBlank flag on reset
+        self.status = 0;
         self.ctrl = 0;
         self.mask = 0;
         self.nmi_occurred = false;
@@ -582,17 +524,6 @@ impl PPU {
         self.bg_shifter_pattern_hi = 0;
         self.bg_shifter_attrib_lo = 0;
         self.bg_shifter_attrib_hi = 0;
-        
-        // Initialize palette with Donkey Kong-like colors
-        self.palette_ram[0] = 0x0F; // Black background
-        self.palette_ram[1] = 0x30; // White
-        self.palette_ram[2] = 0x16; // Red
-        self.palette_ram[3] = 0x27; // Green
-        
-        // Sprite palettes
-        self.palette_ram[17] = 0x30; // White for sprites
-        self.palette_ram[18] = 0x27; // Green for sprites
-        self.palette_ram[19] = 0x16; // Red for sprites
     }
     
     pub fn frame_ready(&self) -> bool {
